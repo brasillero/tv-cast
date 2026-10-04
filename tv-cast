@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT=$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")
+PS=/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe
+usage() {
+  cat <<'EOF'
+Uso: tv-cast [connect [NOME] | disconnect | status | list | mode clone|extend]
+     tv-cast connect [NOME] --dry-run
+     tv-cast disconnect --dry-run
+     tv-cast mode clone|extend --dry-run
+Padrão: connect, com o DEVICE do arquivo config ao lado deste script.
+--dry-run valida sem enviar teclas, clicar ou mudar a projeção.
+Códigos: 0 sucesso; 2 uso/configuração; 3 erro; 4 proteção/estado incerto;
+         5 dispositivo/controle não encontrado; 124 timeout.
+EOF
+}
+die() { printf 'Erro: %s\n' "$*" >&2; exit 2; }
+for dependency in python3 timeout flock wslpath; do
+  command -v "$dependency" >/dev/null || die "comando necessário ausente: $dependency"
+done
+[[ -x $PS ]] || die 'Windows PowerShell não encontrado; execute dentro do WSL.'
+action=connect
+device=''
+mode=''
+dry=false
+args=()
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run) dry=true ;;
+    --help|-h) usage; exit 0 ;;
+    *) args+=("$arg") ;;
+  esac
+done
+if ((${#args[@]})); then action=${args[0]}; args=("${args[@]:1}"); fi
+case "$action" in
+  connect)
+    ((${#args[@]} <= 1)) || die 'passe o nome inteiro entre aspas.'
+    if ((${#args[@]})); then
+      device=${args[0]}
+    else
+      [[ -f $ROOT/config ]] || die "config não encontrado; rode: cp '$ROOT/config.example' '$ROOT/config' e edite DEVICE."
+      device=$(python3 - "$ROOT/config" <<'PY'
+import ast, pathlib, sys
+try:
+    lines = pathlib.Path(sys.argv[1]).read_text(encoding='utf-8').splitlines()
+    entries = [line.split('=', 1)[1].strip() for line in lines
+               if line.strip().startswith('DEVICE=')]
+    if len(entries) != 1:
+        raise ValueError('configure exatamente uma linha DEVICE="Nome da TV"')
+    value = ast.literal_eval(entries[0])
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError('DEVICE deve ser uma string não vazia entre aspas')
+    print(value)
+except Exception as exc:
+    print('Erro no config: ' + str(exc), file=sys.stderr)
+    sys.exit(2)
+PY
+      ) || exit 2
+    fi
+    [[ -n ${device//[[:space:]]/} ]] || die 'nome vazio.'
+    ;;
+  disconnect|status|list) ((${#args[@]} == 0)) || die 'argumentos inesperados.' ;;
+  mode)
+    ((${#args[@]} == 1)) || die 'use mode clone ou mode extend.'
+    mode=${args[0]}
+    [[ $mode == clone || $mode == extend ]] || die 'use mode clone ou mode extend.' ;;
+  *) usage >&2; exit 2 ;;
+esac
+# EncodedCommand evita que aspas, acentos e nomes se tornem código PowerShell.
+encoded=$(python3 - <<'PY'
+import base64
+script = """
+$ErrorActionPreference='Stop'
+$ProgressPreference='SilentlyContinue'
+[Console]::OutputEncoding=[Text.Encoding]::UTF8
+try {
+    $service=New-Object -ComObject Schedule.Service
+    $service.Connect()
+    $task=@($service.GetFolder('\\').GetTasks(0) | Where-Object { $_.Name -eq 'tv-cast' })
+    if ($task.Count -gt 0 -and ($task[0].State -eq 4 -or $task[0].State -eq 2)) {
+        [Console]::Error.WriteLine('Erro: tarefa tv-cast ainda ativa; aguarde até 85 s antes de tentar novamente.')
+        exit 4
+    }
+    [Console]::Write((Join-Path $env:LOCALAPPDATA 'tv-cast'))
+} catch {
+    [Console]::Error.WriteLine('Erro ao consultar o Windows: ' + $_.Exception.Message)
+    exit 3
+}
+"""
+print(base64.b64encode(script.encode('utf-16le')).decode())
+PY
+)
+set +e
+win_dir=$(timeout --kill-after=3s 15s "$PS" -NoLogo -NoProfile -NonInteractive -EncodedCommand "$encoded")
+rc=$?
+set -e
+if ((rc != 0)); then
+  ((rc == 4)) && exit 4
+  printf 'Erro: não foi possível consultar LOCALAPPDATA (código %s).\n' "$rc" >&2
+  ((rc == 124 || rc == 137)) && exit 124
+  exit 3
+fi
+win_dir=${win_dir//$'\r'/}
+win_dir=${win_dir#$'\xef\xbb\xbf'}
+[[ $win_dir == [A-Za-z]:\\* ]] || die 'LOCALAPPDATA retornou um caminho inesperado.'
+stage=$(wslpath -u "$win_dir")
+mkdir -p -- "$stage"
+exec 9>"$stage/.wsl.lock"
+flock -w 5 9 || { printf 'Erro: outro tv-cast está em execução.\n' >&2; exit 4; }
+for file in driver.ps1 worker.ps1 CastHelper.cs; do
+  if [[ ! -f $stage/$file ]] || ! cmp -s -- "$ROOT/$file" "$stage/$file"; then
+    cp -- "$ROOT/$file" "$stage/$file"
+  fi
+done
+python3 - "$stage/request.json" "$action" "$device" "$mode" "$dry" <<'PY'
+import json, pathlib, sys, uuid
+pathlib.Path(sys.argv[1]).write_text(json.dumps(dict(
+    requestId=str(uuid.uuid4()), action=sys.argv[2], device=sys.argv[3],
+    mode=sys.argv[4], dryRun=sys.argv[5]=='true'), ensure_ascii=False), encoding='utf-8')
+PY
+encoded=$(python3 - "$win_dir" <<'PY'
+import base64, sys
+path = (sys.argv[1] + '\\driver.ps1').replace("'", "''")
+script = "$ProgressPreference='SilentlyContinue'; [Console]::OutputEncoding=[Text.Encoding]::UTF8; & '" + path + "'; exit $LASTEXITCODE"
+print(base64.b64encode(script.encode('utf-16le')).decode())
+PY
+)
+set +e
+timeout --kill-after=5s 100s "$PS" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand "$encoded"
+rc=$?
+set -e
+if ((rc == 124 || rc == 137)); then
+  printf 'Erro: timeout de comunicação com o Windows; a tarefa também tem limite de 85 s.\n' >&2
+  exit 124
+fi
+exit "$rc"
